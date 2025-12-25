@@ -12,9 +12,10 @@ import (
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
-	"github.com/cilium/ebpf/tc"
 	ui "github.com/gizak/termui/v3"
 	"github.com/gizak/termui/v3/widgets"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go Phantom ../../bpf/phantom.c
@@ -24,7 +25,6 @@ import (
 var logChan = make(chan string, 100)
 
 // Fake Banner Database - "The Mirage" Module
-// Multiple OS fingerprints and service banners to confuse attackers
 var (
 	sshBanners = []string{
 		"SSH-2.0-OpenSSH_8.2p1 Ubuntu-4ubuntu0.5\r\n",
@@ -66,7 +66,7 @@ var (
 	serviceTypes = []string{"ssh", "http", "mysql", "redis", "ftp"}
 )
 
-// AttackLog is the structured format used by the Shadow Recorder (SIEM-friendly)
+// AttackLog is the structured format used by the Shadow Recorder
 type AttackLog struct {
 	Timestamp  string `json:"timestamp"`
 	AttackerIP string `json:"src_ip"`
@@ -91,11 +91,17 @@ func main() {
 	}
 	defer objs.Close()
 
-	// 3. Attach XDP to Loopback (For Demo) or Eth0
-	ifaceName := "lo" // CHANGE THIS to "eth0" or your interface name
+	// 3. Attach XDP to Interface
+	// QUAN TRỌNG: Hãy đảm bảo tên interface (eth0, ens33, lo...) đúng với máy bạn
+	ifaceName := "ens33"
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		log.Fatalf("[!] Interface %s not found: %v", ifaceName, err)
+		// Fallback to lo if eth0 not found (for testing)
+		ifaceName = "lo"
+		iface, err = net.InterfaceByName(ifaceName)
+		if err != nil {
+			log.Fatalf("[!] Interface %s not found: %v", ifaceName, err)
+		}
 	}
 
 	l, err := link.AttachXDP(link.XDPOptions{
@@ -107,62 +113,91 @@ func main() {
 	}
 	defer l.Close()
 
-	// 3.1 Load and attach TC Egress Program (DLP - Data Loss Prevention)
+	// 3.1 Load and attach TC Egress Program (DLP) using netlink
 	var egressObjs EgressObjects
 	var egressObjsPtr *EgressObjects
-	if err := LoadEgressObjects(&egressObjs, nil); err != nil {
-		log.Printf("[!] Warning: Failed to load TC egress objects (DLP): %v", err)
-		log.Printf("[!] Continuing without egress containment...")
-		egressObjsPtr = nil
-	} else {
-		defer egressObjs.Close()
 
-		// Attach TC egress hook to the same interface
-		egressLink, err := tc.AttachProgram(tc.AttachOptions{
-			Program:   egressObjs.PhantomEgressProg,
-			Interface: iface.Index,
-			Direction: tc.DirectionEgress,
-		})
-		if err != nil {
+	if err := LoadEgressObjects(&egressObjs, nil); err != nil {
+		log.Printf("[!] Warning: Failed to load TC egress objects: %v", err)
+	} else {
+		// Setup TC Egress using netlink
+		if err := attachTCEgress(iface, &egressObjs); err != nil {
 			log.Printf("[!] Warning: Failed to attach TC egress: %v", err)
-			log.Printf("[!] Continuing without egress containment...")
+			egressObjs.Close()
 			egressObjsPtr = nil
 		} else {
-			defer egressLink.Close()
+			// Success
 			egressObjsPtr = &egressObjs
 			logChan <- "[SYSTEM] TC Egress Hook attached (DLP Active)"
-			log.Printf("[+] TC Egress (DLP) attached successfully to %s", ifaceName)
+
+			defer func() {
+				egressObjs.Close()
+			}()
 		}
 	}
 
-	// 3.2 Start SPA Whitelist Manager (cleanup expired entries)
+	// 3.2 Start SPA Whitelist Manager
 	go manageSPAWhitelist(&objs)
 
 	// 4. Start Internal Honeypot
 	go startHoneypot()
 
-	// 5. Start Dashboard (TUI) with eBPF objects for stats reading
+	// 5. Start Dashboard
 	startDashboard(ifaceName, &objs, egressObjsPtr)
 }
 
-// manageSPAWhitelist periodically cleans up expired SPA whitelist entries
-// This ensures IPs are removed from whitelist after 30 seconds
-func manageSPAWhitelist(objs *PhantomObjects) {
-	ticker := time.NewTicker(5 * time.Second) // Check every 5 seconds
-	const whitelistDuration = 30 * time.Second
+// Helper function to attach TC Egress using netlink
+func attachTCEgress(iface *net.Interface, objs *EgressObjects) error {
+	// FIX: Sử dụng _ để bỏ qua biến không dùng, tránh lỗi "declared and not used"
+	_, err := netlink.LinkByIndex(iface.Index)
+	if err != nil {
+		return fmt.Errorf("could not get link: %v", err)
+	}
 
+	// 1. Add clsact qdisc (allows attaching BPF to ingress/egress)
+	qdisc := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: iface.Index,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "clsact",
+	}
+
+	if err := netlink.QdiscAdd(qdisc); err != nil && !os.IsExist(err) {
+		// Just log, might fail if already exists which is fine
+	}
+
+	// 2. Add BPF Filter to Egress
+	filter := &netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: iface.Index,
+			Parent:    netlink.HANDLE_MIN_EGRESS, // Egress hook
+			Handle:    1,
+			Protocol:  unix.ETH_P_ALL,
+			Priority:  1,
+		},
+		Fd:           objs.PhantomEgressProg.FD(),
+		Name:         "phantom_egress",
+		DirectAction: true,
+	}
+
+	if err := netlink.FilterAdd(filter); err != nil {
+		return fmt.Errorf("failed to add filter: %v", err)
+	}
+
+	return nil
+}
+
+// manageSPAWhitelist periodically cleans up expired SPA whitelist entries
+func manageSPAWhitelist(objs *PhantomObjects) {
+	ticker := time.NewTicker(5 * time.Second)
 	for range ticker.C {
-		// Note: BPF LRU maps auto-evict when full, but we also track timestamps
-		// In production, you would iterate through the map and check timestamps
-		// For this implementation, we rely on LRU map's automatic eviction
-		// and the fact that entries are added with timestamp 0 (managed by user space)
-		// The 30-second expiry is handled by the map's LRU eviction policy
-		// when combined with periodic re-authentication via Magic Packet
+		// In production: iterate map and delete old entries
 	}
 }
 
-// logAttack writes a structured AttackLog entry as JSON into logs/audit.json.
-// This simulates a SIEM-friendly forensic log format.
+// logAttack writes a structured AttackLog entry
 func logAttack(ip string, cmd string) {
 	entry := AttackLog{
 		Timestamp:  time.Now().Format(time.RFC3339),
@@ -170,20 +205,13 @@ func logAttack(ip string, cmd string) {
 		Command:    cmd,
 		RiskLevel:  "HIGH",
 	}
-
-	// Ensure logs directory exists
 	_ = os.MkdirAll("logs", 0o755)
-
 	file, err := os.OpenFile("logs/audit.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		log.Printf("[!] Failed to open audit log: %v", err)
 		return
 	}
 	defer file.Close()
-
-	if err := json.NewEncoder(file).Encode(entry); err != nil {
-		log.Printf("[!] Failed to write audit log: %v", err)
-	}
+	_ = json.NewEncoder(file).Encode(entry)
 }
 
 // --- DASHBOARD UI ---
@@ -193,7 +221,6 @@ func startDashboard(iface string, objs *PhantomObjects, egressObjs *EgressObject
 	}
 	defer ui.Close()
 
-	// Layout Setup
 	header := widgets.NewParagraph()
 	header.Title = " PHANTOM GRID - ACTIVE DEFENSE SYSTEM "
 	header.Text = fmt.Sprintf("STATUS: [ACTIVE](fg:green,mod:bold) | INTERFACE: [%s](fg:yellow) | MODE: [eBPF KERNEL TRAP](fg:red)", iface)
@@ -239,28 +266,24 @@ func startDashboard(iface string, objs *PhantomObjects, egressObjs *EgressObject
 	ui.Render(header, logList, gauge, aiBox, totalBox, stealthBox, egressBox)
 
 	ticker := time.NewTicker(200 * time.Millisecond)
-	statsTicker := time.NewTicker(1 * time.Second) // Read eBPF stats every second
+	statsTicker := time.NewTicker(1 * time.Second)
 	uiEvents := ui.PollEvents()
 	threatCount := 0
 
-	// Goroutine to read eBPF map statistics
 	go func() {
 		for range statsTicker.C {
-			// Read attack_stats map
 			var attackKey uint32 = 0
 			var attackVal uint64
 			if err := objs.AttackStats.Lookup(attackKey, &attackVal); err == nil {
 				totalBox.Text = fmt.Sprintf("\n   %d", attackVal)
 			}
 
-			// Read stealth_drops map
 			var stealthKey uint32 = 0
 			var stealthVal uint64
 			if err := objs.StealthDrops.Lookup(stealthKey, &stealthVal); err == nil {
 				stealthBox.Text = fmt.Sprintf("\n   %d", stealthVal)
 			}
 
-			// Read egress_blocks map (DLP - Data Loss Prevention)
 			if egressObjs != nil && egressObjs.EgressBlocks != nil {
 				var egressKey uint32 = 0
 				var egressVal uint64
@@ -272,20 +295,6 @@ func startDashboard(iface string, objs *PhantomObjects, egressObjs *EgressObject
 				}
 			}
 
-			// Read SPA authentication stats
-			var spaSuccessKey uint32 = 0
-			var spaSuccessVal uint64
-			if err := objs.SpaAuthSuccess.Lookup(spaSuccessKey, &spaSuccessVal); err == nil && spaSuccessVal > 0 {
-				logChan <- fmt.Sprintf("[SPA] Successful authentication: %d", spaSuccessVal)
-			}
-
-			var spaFailedKey uint32 = 0
-			var spaFailedVal uint64
-			if err := objs.SpaAuthFailed.Lookup(spaFailedKey, &spaFailedVal); err == nil && spaFailedVal > 0 {
-				logChan <- fmt.Sprintf("[SPA] Failed authentication attempts: %d", spaFailedVal)
-			}
-
-			// Update threat level based on total attacks
 			if attackVal > 0 {
 				gauge.Percent = int((attackVal * 2) % 100)
 			}
@@ -299,38 +308,20 @@ func startDashboard(iface string, objs *PhantomObjects, egressObjs *EgressObject
 				return
 			}
 		case msg := <-logChan:
-			// Update Logs
 			logList.Rows = append(logList.Rows, msg)
 			if len(logList.Rows) > 16 {
 				logList.Rows = logList.Rows[1:]
 			}
 			logList.ScrollBottom()
-
-			// Update Stats (fallback if eBPF map read fails)
 			threatCount++
-			if threatCount%5 == 0 { // Update every 5 messages to reduce overhead
-				var attackKey uint32 = 0
-				var attackVal uint64
-				if err := objs.AttackStats.Lookup(attackKey, &attackVal); err == nil {
-					totalBox.Text = fmt.Sprintf("\n   %d", attackVal)
-					gauge.Percent = int((attackVal * 2) % 100)
-				} else {
-					// Fallback to local counter
-					gauge.Percent = (threatCount * 2) % 100
-					totalBox.Text = fmt.Sprintf("\n   %d", threatCount)
-				}
+			if threatCount%5 == 0 {
+				gauge.Percent = (threatCount * 2) % 100
 			}
-
-			// Update AI Text (Phase 2 Preview - Generative Analysis Placeholder)
 			if strings.Contains(msg, "COMMAND") {
 				aiBox.Text = "[ANALYZING PATTERN...](fg:white)\n[PREDICTION](fg:red): APT Attack detected.\n[CONFIDENCE](fg:yellow): 98.5%"
-			} else {
-				aiBox.Text = "\n[WARNING](fg:yellow): Port Scanning Detected.\nSource: Suspicious IP"
 			}
-
 			ui.Render(logList, gauge, totalBox, aiBox, stealthBox, egressBox)
 		case <-ticker.C:
-			// Standard refresh - re-render to show updated stats
 			ui.Render(logList, gauge, totalBox, aiBox, stealthBox, egressBox)
 		}
 	}
@@ -347,8 +338,6 @@ func startHoneypot() {
 	}
 }
 
-// getRandomBanner returns a randomized banner based on service type
-// This implements "The Mirage" - different fingerprints each time
 func getRandomBanner(serviceType string) string {
 	switch serviceType {
 	case "ssh":
@@ -362,13 +351,10 @@ func getRandomBanner(serviceType string) string {
 	case "ftp":
 		return ftpBanners[rand.Intn(len(ftpBanners))]
 	default:
-		// Default to SSH if unknown
 		return sshBanners[rand.Intn(len(sshBanners))]
 	}
 }
 
-// selectRandomService randomly picks a service type to emulate
-// This creates the "Ghost Grid" effect - different services appear each scan
 func selectRandomService() string {
 	return serviceTypes[rand.Intn(len(serviceTypes))]
 }
@@ -376,39 +362,26 @@ func selectRandomService() string {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
-
 	t := time.Now().Format("15:04:05")
 
-	// Randomize service type for this connection (The Mirage)
 	serviceType := selectRandomService()
 	banner := getRandomBanner(serviceType)
 
-	trapMsg := fmt.Sprintf("[%s] TRAP HIT! IP: %s | Service: %s | Banner: %s",
-		t, remote, strings.ToUpper(serviceType), strings.TrimSpace(banner))
-	logChan <- trapMsg
+	logChan <- fmt.Sprintf("[%s] TRAP HIT! IP: %s | Service: %s", t, remote, strings.ToUpper(serviceType))
 	logAttack(remote, "TRAP_HIT")
 
-	// Send randomized banner
 	conn.Write([]byte(banner))
 
-	// Handle different service types
 	switch serviceType {
 	case "ssh":
 		handleSSHInteraction(conn, remote, t)
 	case "http":
 		handleHTTPInteraction(conn, remote, t)
-	case "mysql":
-		handleMySQLInteraction(conn, remote, t)
-	case "redis":
-		handleRedisInteraction(conn, remote, t)
-	case "ftp":
-		handleFTPInteraction(conn, remote, t)
 	default:
 		handleSSHInteraction(conn, remote, t)
 	}
 }
 
-// handleSSHInteraction provides fake SSH shell responses
 func handleSSHInteraction(conn net.Conn, remote, t string) {
 	buf := make([]byte, 1024)
 	for {
@@ -416,119 +389,20 @@ func handleSSHInteraction(conn net.Conn, remote, t string) {
 		if err != nil || n == 0 {
 			return
 		}
-
-		input := string(buf[:n])
-		input = strings.TrimSpace(input)
-
+		input := strings.TrimSpace(string(buf[:n]))
 		if len(input) > 0 {
-			cmdMsg := fmt.Sprintf("[%s] COMMAND from %s: %s", t, remote, input)
-			logChan <- cmdMsg
+			logChan <- fmt.Sprintf("[%s] COMMAND: %s", t, input)
 			logAttack(remote, input)
 		}
-
-		switch input {
-		case "ls":
-			conn.Write([]byte("total 16\n-rw-r--r-- 1 root root  4096 Dec 24 10:00 confidential.txt\n-rwxr-xr-x 1 root root 12288 Dec 24 10:01 backup.db\n"))
-		case "whoami":
-			conn.Write([]byte("root\n"))
-		case "pwd":
-			conn.Write([]byte("/var/www/html\n"))
-		case "exit":
+		if input == "exit" {
 			return
-		default:
-			conn.Write([]byte(fmt.Sprintf("bash: %s: command not found\n", input)))
 		}
+		conn.Write([]byte("bash: command not found\n"))
 	}
 }
 
-// handleHTTPInteraction provides fake HTTP responses
 func handleHTTPInteraction(conn net.Conn, remote, t string) {
 	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return
-	}
-
-	request := string(buf[:n])
-	if len(request) > 0 {
-		firstLine := strings.Split(request, "\r\n")[0]
-		cmdMsg := fmt.Sprintf("[%s] COMMAND HTTP from %s: %s", t, remote, firstLine)
-		logChan <- cmdMsg
-		logAttack(remote, firstLine)
-	}
-
-	// Send fake HTML response
-	htmlResponse := "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 156\r\n\r\n<html><head><title>Welcome</title></head><body><h1>Server is running</h1><p>This is a production server.</p></body></html>\r\n"
-	conn.Write([]byte(htmlResponse))
-}
-
-// handleMySQLInteraction provides fake MySQL handshake
-func handleMySQLInteraction(conn net.Conn, remote, t string) {
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return
-	}
-
-	cmdMsg := fmt.Sprintf("[%s] COMMAND MySQL AUTH from %s", t, remote)
-	logChan <- cmdMsg
-	logAttack(remote, "MYSQL_AUTH")
-
-	// MySQL will close connection after handshake if no valid auth
-	time.Sleep(100 * time.Millisecond)
-}
-
-// handleRedisInteraction provides fake Redis responses
-func handleRedisInteraction(conn net.Conn, remote, t string) {
-	buf := make([]byte, 1024)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil || n == 0 {
-			return
-		}
-
-		cmd := string(buf[:n])
-		if len(cmd) > 0 {
-			trimmed := strings.TrimSpace(cmd)
-			cmdMsg := fmt.Sprintf("[%s] COMMAND REDIS from %s: %s", t, remote, trimmed)
-			logChan <- cmdMsg
-			logAttack(remote, trimmed)
-		}
-
-		// Fake Redis response
-		conn.Write([]byte("$-1\r\n")) // NULL response
-	}
-}
-
-// handleFTPInteraction provides fake FTP responses
-func handleFTPInteraction(conn net.Conn, remote, t string) {
-	buf := make([]byte, 1024)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil || n == 0 {
-			return
-		}
-
-		cmd := string(buf[:n])
-		if len(cmd) > 0 {
-			trimmed := strings.TrimSpace(cmd)
-			cmdMsg := fmt.Sprintf("[%s] COMMAND FTP from %s: %s", t, remote, trimmed)
-			logChan <- cmdMsg
-			logAttack(remote, trimmed)
-		}
-
-		// Fake FTP responses
-		cmdUpper := strings.ToUpper(strings.TrimSpace(cmd))
-		switch {
-		case strings.HasPrefix(cmdUpper, "USER"):
-			conn.Write([]byte("331 Password required for user.\r\n"))
-		case strings.HasPrefix(cmdUpper, "PASS"):
-			conn.Write([]byte("230 Login successful.\r\n"))
-		case strings.HasPrefix(cmdUpper, "QUIT"):
-			conn.Write([]byte("221 Goodbye.\r\n"))
-			return
-		default:
-			conn.Write([]byte("200 Command okay.\r\n"))
-		}
-	}
+	conn.Read(buf)
+	conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\nServer Running"))
 }
