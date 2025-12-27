@@ -218,9 +218,12 @@ func main() {
 
 	// Attach XDP to detected interface
 	// CHỈ attach vào interface chính để tránh conflict và treo máy
+	// Sử dụng XDPGenericMode để tương thích tốt hơn với VMware và các virtual interfaces
+	// Generic mode chạy trong kernel network stack, tương thích tốt hơn Native mode
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.PhantomProg,
 		Interface: iface.Index,
+		Flags:     link.XDPGenericMode, // QUAN TRỌNG: Generic mode cho VMware compatibility
 	})
 	if err != nil {
 		log.Fatal("[!] Failed to attach XDP:", err)

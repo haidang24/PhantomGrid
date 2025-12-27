@@ -3,11 +3,13 @@
 ## 🔍 Vấn Đề
 
 Khi quét từ chính máy chủ (localhost):
+
 ```bash
 nmap 192.168.174.163  # Quét từ chính máy chủ
 ```
 
 Kết quả vẫn thấy các port cần ẩn:
+
 - Port 22 (SSH) - **open**
 - Port 3306 (MySQL) - **open**
 - Port 5432 (PostgreSQL) - **open**
@@ -37,6 +39,7 @@ XDP KHÔNG xử lý (vì attach vào ens33, không phải lo)
 ### 3. Services Vẫn Đang Chạy
 
 Nếu có service thật đang chạy trên các port critical assets:
+
 - SSH daemon trên port 22
 - MySQL trên port 3306
 - PostgreSQL trên port 5432
@@ -56,6 +59,7 @@ nmap <SERVER_IP>
 ```
 
 **Kết quả mong đợi:**
+
 - Port 22: **filtered** hoặc **closed** (XDP DROP)
 - Port 3306: **filtered** hoặc **closed** (XDP DROP)
 - Port 80, 443: **open** (fake ports, redirected to honeypot)
@@ -78,7 +82,8 @@ sudo systemctl stop postgresql
 sudo systemctl stop redis
 ```
 
-**Lưu ý:** 
+**Lưu ý:**
+
 - **KHÔNG stop SSH** nếu bạn đang SSH vào máy
 - Chỉ stop các service không cần thiết
 
@@ -97,6 +102,7 @@ link.AttachXDP(link.XDPOptions{
 ```
 
 **Vấn đề:**
+
 - Có thể chặn localhost services (SSH, database connections từ localhost)
 - Có thể gây conflict với các ứng dụng khác
 - **Không khuyến nghị** cho production
@@ -145,22 +151,24 @@ ssh user@<SERVER_IP>
 
 ## 📊 So Sánh Localhost vs External Scan
 
-| Aspect | Localhost Scan | External Scan |
-|--------|---------------|---------------|
-| **Interface** | `lo` (loopback) | `ens33` (external) |
-| **XDP Processing** | ❌ Không | ✅ Có |
-| **Critical Ports** | Hiện "open" | Hiện "filtered/closed" |
-| **Fake Ports** | Hiện "open" | Hiện "open" (honeypot) |
-| **Use Case** | ❌ Không test được XDP | ✅ Test đúng XDP |
+| Aspect             | Localhost Scan         | External Scan          |
+| ------------------ | ---------------------- | ---------------------- |
+| **Interface**      | `lo` (loopback)        | `ens33` (external)     |
+| **XDP Processing** | ❌ Không               | ✅ Có                  |
+| **Critical Ports** | Hiện "open"            | Hiện "filtered/closed" |
+| **Fake Ports**     | Hiện "open"            | Hiện "open" (honeypot) |
+| **Use Case**       | ❌ Không test được XDP | ✅ Test đúng XDP       |
 
 ## 🎯 Kết Luận
 
 **Localhost scan KHÔNG thể test XDP protection vì:**
+
 1. Traffic đi qua loopback (`lo`), không qua `ens33`
 2. XDP chỉ attach vào `ens33`
 3. Services trả lời trực tiếp, bỏ qua XDP
 
 **Để test XDP protection đúng cách:**
+
 - ✅ Scan từ **external machine** (Kali, Windows, etc.)
 - ✅ Hoặc stop services trên critical ports (trừ SSH nếu đang dùng)
 - ❌ Không nên attach XDP vào loopback (có thể gây vấn đề)
@@ -180,4 +188,3 @@ sudo bpftool map dump name attack_stats
 # Test từ external machine
 nmap -v <SERVER_IP>
 ```
-
