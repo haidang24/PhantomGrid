@@ -135,16 +135,14 @@ static __always_inline void mutate_os_personality(struct iphdr *ip, struct tcphd
     
     if (old_ttl != new_ttl) {
         ip->ttl = new_ttl;
-        // IP checksum needs to account for TTL change
-        // TTL is in the second byte of the IP header word containing TTL and protocol
-        __be16 old_word = bpf_htons(((__u16)old_ttl << 8) | ip->protocol);
-        __be16 new_word = bpf_htons(((__u16)new_ttl << 8) | ip->protocol);
-        update_csum16(&ip->check, old_word, new_word);
+        // Với XDP Generic mode, set checksum = 0 để kernel tự tính lại
+        ip->check = 0;
     }
     
     if (old_window != new_window) {
-        update_csum16(&tcp->check, old_window, new_window);
         tcp->window = new_window;
+        // Với XDP Generic mode, set checksum = 0 để kernel tự tính lại
+        tcp->check = 0;
     }
     
     __u32 key = 0;
@@ -324,8 +322,12 @@ int phantom_prog(struct xdp_md *ctx) {
 
         // 3. QUAN TRỌNG: PASS tất cả packets đến HONEYPOT_PORT (9999)
         // Đảm bảo honeypot nhận được tất cả connections (SYN, ACK, data, FIN, RST)
+        // LƯU Ý: Không mutate OS personality cho packets đến port 9999
+        // vì có thể gây checksum issues và làm packets bị drop
+        // QUAN TRỌNG: Không modify packets đến port 9999 để tránh checksum issues
         if (tcp->dest == bpf_htons(HONEYPOT_PORT)) {
-            mutate_os_personality(ip, tcp);
+            // Không mutate, không modify - chỉ PASS
+            // Kernel sẽ tự động recalculate checksum nếu cần
             return XDP_PASS;
         }
 
@@ -340,15 +342,21 @@ int phantom_prog(struct xdp_md *ctx) {
         __be16 old_port = tcp->dest;
         __be16 new_port = bpf_htons(HONEYPOT_PORT);
         
-        // Update checksum trước khi thay đổi port
+        // Update checksum TRƯỚC khi thay đổi port
         update_csum16(&tcp->check, old_port, new_port);
         tcp->dest = new_port;
         
         // Mutate OS personality để confuse fingerprinting
+        // LƯU Ý: mutate_os_personality modify IP checksum (TTL) và TCP checksum (Window)
+        // Nhưng vì đã update TCP checksum cho port redirect, nên cần gọi sau
+        // mutate_os_personality sẽ update lại TCP checksum cho Window change
         mutate_os_personality(ip, tcp);
         
         // QUAN TRỌNG: Return XDP_PASS ngay sau khi redirect
         // Packet bây giờ có dest_port = 9999, sẽ được kernel forward đến honeypot
+        // Kernel sẽ tự động gửi SYN-ACK khi honeypot Accept() connection
+        // Nếu honeypot không accept, kernel sẽ gửi RST → port hiện "closed"
+        // Nếu XDP drop, không có response → port hiện "filtered"
         return XDP_PASS;
     }
     
