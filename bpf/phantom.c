@@ -363,12 +363,18 @@ int phantom_prog(struct xdp_md *ctx) {
             return XDP_PASS;
         }
         
-        // Nếu dest_port là HONEYPOT_PORT và chưa được track
-        // → Có thể là packet trực tiếp đến honeypot hoặc từ connection đã được redirect
-        // → PASS để honeypot xử lý
+        // QUAN TRỌNG: Tất cả packets đến HONEYPOT_PORT (9999) phải được PASS
+        // Điều này đảm bảo honeypot có thể nhận và xử lý tất cả connections
+        // Bao gồm: SYN (kết nối mới), ACK (established), data, FIN, RST
         if (tcp->dest == bpf_htons(HONEYPOT_PORT)) {
+            // Update statistics cho SYN packets đến honeypot
+            if (syn && !ack) {
+                __u32 key = 0;
+                __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
+                if (val) __sync_fetch_and_add(val, 1);
+            }
             mutate_os_personality(ip, tcp);
-            return XDP_PASS;
+            return XDP_PASS; // PASS tất cả packets đến honeypot
         }
         
         // 4. THE MIRAGE: Xử lý SYN packets mới (inbound connection initiation)
@@ -397,16 +403,8 @@ int phantom_prog(struct xdp_md *ctx) {
                 return XDP_PASS; // Redirect đến honeypot port 9999
             }
             
-            // Nếu là honeypot port (9999) → PASS (honeypot sẽ phản hồi SYN-ACK)
-            // Điều này cho phép kết nối trực tiếp đến honeypot hoặc từ connection đã redirect
-            if (tcp->dest == bpf_htons(HONEYPOT_PORT)) {
-                __u32 key = 0;
-                __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
-                if (val) __sync_fetch_and_add(val, 1);
-                
-                mutate_os_personality(ip, tcp);
-                return XDP_PASS;
-            }
+            // Lưu ý: SYN packets đến honeypot port (9999) đã được xử lý ở trên
+            // Nếu đến đây, dest_port không phải 9999 và không phải fake port
             
             // Nếu không phải fake port và không phải critical asset → DROP (ẩn port)
             // Điều này đảm bảo hacker chỉ thấy các port giả, không thấy các port thật
