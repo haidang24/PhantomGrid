@@ -29,4 +29,14 @@ clean:
 deps:
 	go mod tidy
 
+test:
+	go test -v ./cmd/agent/...
+	go test -v ./cmd/spa-client/...
+
+test-coverage:
+	go test -v -coverprofile=coverage.out ./cmd/agent/...
+	go test -v -coverprofile=coverage-spa.out ./cmd/spa-client/...
+	go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report generated: coverage.html"
+
 

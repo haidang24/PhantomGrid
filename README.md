@@ -58,7 +58,7 @@ It turns a normal Linux server into a controlled, deceptive attack surface that:
   - XDP program attached to a chosen network interface (for example, `eth0` or `lo` for demo).
   - Intercepts IPv4 TCP/UDP packets at the NIC driver level (wire-speed processing).
   - **Single Packet Authorization (SPA)**:
-    - **Magic Packet Detection**: Listens for UDP packets on port 1337 containing secret token `PHANTOM_GRID_SPA_2024`
+    - **Magic Packet Detection**: Listens for UDP packets on port 1337 containing secret token `PHANTOM_GRID_SPA_2025`
     - **Automatic Whitelisting**: Validates token and whitelists source IP for 30 seconds
     - **SSH Port Protection**: SSH port 22 is **completely closed** unless source IP is whitelisted
     - **Server Invisibility**: All traffic to SSH port from non-whitelisted IPs is dropped, making server appear "dead"
@@ -154,19 +154,36 @@ go mod tidy
 
 The project includes a `Makefile` for a one-command workflow:
 
+**Quick Start (Auto-detect interface):**
+
 ```bash
 make run
+```
+
+**Run with specific interface:**
+
+```bash
+# List available interfaces
+ip link show
+
+# Run with specific interface (e.g., ens33, eth0, wlx00127b2163a6)
+make run-interface INTERFACE=ens33
+
+# Or directly:
+sudo ./phantom-grid -interface ens33
 ```
 
 This will:
 
 1. Run `go generate` to compile the eBPF program via `bpf2go`.
 2. Build the Go user-space agent into a binary named `phantom-grid`.
-3. Execute `sudo ./phantom-grid` to:
-   - Attach the XDP program to the interface defined in `cmd/agent/main.go` (default `lo`), and
-   - Start the honeypot and dashboard.
+3. Build the SPA client tool `spa-client`.
+4. Execute `sudo ./phantom-grid` to:
+   - Auto-detect or use specified network interface
+   - Attach the XDP program to the interface
+   - Start the honeypot and dashboard
 
-> Important: edit `ifaceName` in `cmd/agent/main.go` to match your real interface (for example, `eth0`, `ens33`) when deploying on a live system.
+> **Important**: For production deployment, specify the external interface using `-interface` flag. The system will auto-detect if not specified, but may default to loopback (`lo`) which won't capture external traffic.
 
 ---
 
@@ -277,6 +294,16 @@ If you modify `bpf/phantom.c`, regenerate the Go bindings:
 
 ```bash
 go generate ./...
+```
+
+- **Running tests**
+
+```bash
+# Run all tests
+make test
+
+# Run tests with coverage
+make test-coverage
 ```
 
 - **Cleaning build artifacts**

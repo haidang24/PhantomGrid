@@ -1,0 +1,50 @@
+# Binaries
+phantom-grid
+spa-client
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Generated eBPF files
+cmd/agent/phantom_bpf*.go
+cmd/agent/phantom_bpf*.o
+cmd/agent/egress_bpf*.go
+cmd/agent/egress_bpf*.o
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.a
+
+# Temporary files
+*.tmp
+*.temp
+

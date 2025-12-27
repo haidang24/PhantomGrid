@@ -792,6 +792,7 @@ func startHoneypot() {
 
 	// Fallback: Bind port 9999 cho các port không bind được
 	// QUAN TRỌNG: Port 9999 phải available để XDP redirect hoạt động
+	logChan <- "[SYSTEM] Attempting to bind honeypot fallback port 9999..."
 	ln9999, err := net.Listen("tcp", ":9999")
 	if err != nil {
 		logChan <- fmt.Sprintf("[ERROR] Cannot bind port 9999: %v", err)
@@ -888,6 +889,8 @@ func startHoneypot() {
 	}
 
 	logChan <- fmt.Sprintf("[SYSTEM] Honeypot bound to %d ports (%d direct, 1 fallback) - The Mirage active", len(listeners), len(boundPorts))
+	logChan <- "[SYSTEM] ✅ Honeypot is now ACCEPTING connections on port 9999"
+	logChan <- "[SYSTEM] ✅ Ready to receive traffic from external hosts (192.168.1.21, etc.)"
 
 	// Cleanup on exit
 	defer func() {
