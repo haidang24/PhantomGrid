@@ -89,6 +89,17 @@ struct {
     __type(value, __u64);
 } spa_auth_failed SEC(".maps");
 
+// Connection Tracking Map for Transparent Redirection (The Portal)
+// Key: 64-bit = (src_ip << 32) | (src_port << 16) | dest_port
+// Value: Original destination port (before redirect to honeypot)
+// This allows us to redirect ALL packets of a connection, not just SYN
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10000);  // Track up to 10k concurrent connections
+    __type(key, __u64);
+    __type(value, __be16);
+} redirect_map SEC(".maps");
+
 // HELPER: Manual Checksum Update for 16-bit values (ports, windows)
 // Checksum is calculated in network byte order, so we work directly with __be16
 static __always_inline void update_csum16(__u16 *csum, __be16 old_val, __be16 new_val) {
@@ -158,8 +169,12 @@ static __always_inline int is_critical_asset_port(__be16 port) {
 
 // Helper: Check if port is a Fake Port (The Mirage - honeypot will bind these ports)
 // Danh sách này phải khớp với fakePorts trong cmd/agent/main.go
+// LƯU Ý: 9999 là HONEYPOT_PORT (fallback), KHÔNG phải fake port
 static __always_inline int is_fake_port(__be16 port) {
     __u16 p = bpf_ntohs(port);
+    // Nếu là honeypot port, không phải fake port
+    if (p == HONEYPOT_PORT) return 0;
+    
     return (p == 80 ||      // HTTP
             p == 443 ||     // HTTPS
             p == 3306 ||    // MySQL (fake)
@@ -183,8 +198,7 @@ static __always_inline int is_fake_port(__be16 port) {
             p == 3000 ||    // Node.js (fake)
             p == 5000 ||    // Flask (fake)
             p == 8000 ||    // Django (fake)
-            p == 8888 ||    // Jupyter (fake)
-            p == 9999);     // Honeypot (fallback)
+            p == 8888);     // Jupyter (fake)
 }
 
 // FIX: Verify function now takes data_end and checks pointers directly
@@ -305,32 +319,74 @@ int phantom_prog(struct xdp_md *ctx) {
             return XDP_DROP;
         }
 
-        // 3. THE MIRAGE: Pass Fake Ports, Drop Real Ports
-        // THE MIRAGE: Honeypot bind nhiều port giả (80, 443, 3306, etc.)
-        // XDP pass các fake ports để honeypot có thể phản hồi SYN-ACK trực tiếp
-        // Kết quả: Khi quét từ bên ngoài, nmap sẽ thấy nhiều port "mở" (honeypot phản hồi)
-        // Các port thật (không phải fake ports) sẽ bị DROP → ẩn hoàn toàn
+        // 3. THE PORTAL: Transparent Redirection (DNAT không trạng thái)
+        // Khi hacker tương tác sâu hơn với "Dịch vụ ma", lưu lượng mạng bị âm thầm
+        // chuyển hướng sang Container Honeypot để thu thập hành vi.
+        // Quá trình chuyển hướng trong suốt, không thay đổi địa chỉ IP đích.
         
         __u8 *flags_byte = ((__u8 *)tcp + 13);
         __u8 flags = *flags_byte;
         __u8 syn = flags & 0x02;
         __u8 ack = flags & 0x10;
+        __u8 fin = flags & 0x01;
+        __u8 rst = flags & 0x04;
         
-        // CHỈ xử lý SYN packets (không có ACK) - đây là inbound connection initiation
+        // Tạo connection key: (src_ip << 32) | (src_port << 16) | dest_port
+        // Điều này cho phép track và redirect TẤT CẢ packets của connection
+        // Key được tạo dựa trên original dest_port (trước khi redirect)
+        __u16 dest_port_host = bpf_ntohs(tcp->dest);
+        __u64 conn_key = ((__u64)src_ip << 32) | ((__u64)bpf_ntohs(tcp->source) << 16) | (__u64)dest_port_host;
+        
+        // Kiểm tra xem connection này đã được redirect chưa
+        // Nếu dest_port là HONEYPOT_PORT, có thể đây là packet sau khi đã redirect
+        // Cần tìm trong map với original port
+        __be16 *original_port = NULL;
+        
+        // Thử tìm với dest_port hiện tại
+        original_port = bpf_map_lookup_elem(&redirect_map, &conn_key);
+        
+        // Nếu không tìm thấy và dest_port là HONEYPOT_PORT, có thể đây là packet
+        // từ một connection đã được redirect. Tuy nhiên, vì honeypot bind trực tiếp
+        // vào fake ports, nên các packets đến HONEYPOT_PORT không cần redirect nữa.
+        // Chỉ cần redirect các packets đến original fake port.
+        
+        // Nếu connection đã được redirect, tiếp tục redirect tất cả packets
+        if (original_port) {
+            // Connection đã được track - redirect tất cả packets (SYN, ACK, data, FIN, RST)
+            // Chỉ redirect nếu dest_port vẫn là original port (chưa redirect)
+            if (tcp->dest == *original_port && tcp->dest != bpf_htons(HONEYPOT_PORT)) {
+                __be16 old_port = tcp->dest;
+                __be16 new_port = bpf_htons(HONEYPOT_PORT);
+                
+                update_csum16(&tcp->check, old_port, new_port);
+                tcp->dest = new_port;
+            }
+            
+            // Cleanup map khi connection kết thúc (FIN hoặc RST từ client)
+            if ((fin || rst) && !ack) {
+                bpf_map_delete_elem(&redirect_map, &conn_key);
+            }
+            
+            mutate_os_personality(ip, tcp);
+            return XDP_PASS;
+        }
+        
+        // 4. THE MIRAGE: Xử lý SYN packets mới (inbound connection initiation)
         // Bỏ qua các Critical Assets (đã được bảo vệ bởi Phantom Protocol)
-        // Cho phép SYN+ACK, ACK, FIN, RST và các packets khác pass through
-        // Điều này đảm bảo:
-        // - Outbound connections (SYN từ server) hoạt động bình thường
-        // - Established connections (ACK, data packets) hoạt động bình thường
+        // CHỈ xử lý SYN packets (không có ACK) - đây là inbound connection initiation
         if (syn && !ack && !is_critical_asset_port(tcp->dest)) {
-            // Nếu là fake port → REDIRECT đến port 9999 (honeypot fallback)
-            // Điều này đảm bảo dù honeypot không bind được port gốc, vẫn có service listen trên 9999
-            // Redirect đảm bảo packets được forward đến honeypot một cách chắc chắn
+            // Nếu là fake port → REDIRECT đến port 9999 và track connection
             if (is_fake_port(tcp->dest) && tcp->dest != bpf_htons(HONEYPOT_PORT)) {
                 __u32 key = 0;
                 __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
                 if (val) __sync_fetch_and_add(val, 1);
 
+                // Lưu original port vào map TRƯỚC KHI redirect
+                // Connection key đã được tạo với original dest_port ở trên
+                __be16 orig_port = tcp->dest;
+                bpf_map_update_elem(&redirect_map, &conn_key, &orig_port, BPF_ANY);
+
+                // Redirect SYN packet đến honeypot port
                 __be16 old_port = tcp->dest;
                 __be16 new_port = bpf_htons(HONEYPOT_PORT);
                 
@@ -356,10 +412,11 @@ int phantom_prog(struct xdp_md *ctx) {
             return XDP_DROP;
         }
         
-        // Tất cả các packets khác (ACK, FIN, RST, data) sẽ pass through
-        // Điều này cho phép:
-        // - Outbound connections hoạt động bình thường
-        // - Established connections tiếp tục hoạt động sau khi SYN được redirect
+        // 5. Outbound connections và established connections không được track
+        // Cho phép pass through để đảm bảo:
+        // - Outbound connections (SYN từ server) hoạt động bình thường
+        // - Established connections (ACK, data packets) hoạt động bình thường
+        // - Các packets không phải SYN từ external sẽ pass nếu không được track
     }
     return XDP_PASS;
 }

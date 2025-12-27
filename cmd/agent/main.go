@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"math/rand"
@@ -88,6 +89,10 @@ func init() {
 }
 
 func main() {
+	// Parse command line arguments
+	interfaceFlag := flag.String("interface", "", "Network interface name (e.g., eth0, ens33, wlx00127b2163a6). If not specified, auto-detect will be used.")
+	flag.Parse()
+
 	// 1. Initialize System
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal("[!] Failed to lock memory:", err)
@@ -101,8 +106,6 @@ func main() {
 	defer objs.Close()
 
 	// 3. Attach XDP to Interface
-	// QUAN TRỌNG: Hãy đảm bảo tên interface (eth0, ens33, lo...) đúng với máy bạn
-	// Tự động detect interface: ưu tiên eth0, ens33, sau đó fallback về lo
 	ifaceName := ""
 	var iface *net.Interface
 	var err error
@@ -119,84 +122,102 @@ func main() {
 		}
 	}
 
-	// Try common interface names - ưu tiên external interface trước
-	// Để "The Mirage" hoạt động, cần attach vào interface nhận traffic từ bên ngoài
-	// Ưu tiên WiFi interface (wlx*), sau đó ens33 (VMware), rồi các interface khác
-	interfaceNames := []string{"wlx00127b2163a6", "wlan0", "ens33", "eth0", "enp0s3", "enp0s8", "enp0s9", "eth1"}
-	var foundExternal bool
-
-	// First, try to find WiFi interface by pattern (wlx*, wlan*, wlp*)
-	wifiInterfaces, _ := net.Interfaces()
-	for _, candidateIface := range wifiInterfaces {
-		if strings.HasPrefix(candidateIface.Name, "wlx") ||
-			strings.HasPrefix(candidateIface.Name, "wlan") ||
-			strings.HasPrefix(candidateIface.Name, "wlp") {
-			addrs, _ := candidateIface.Addrs()
-			if len(addrs) > 0 {
-				isLoopback := (candidateIface.Flags & net.FlagLoopback) != 0
-				if !isLoopback {
-					// Create a copy to avoid pointer issues
-					ifaceCopy := candidateIface
-					iface = &ifaceCopy
-					ifaceName = candidateIface.Name
-					foundExternal = true
-					log.Printf("[*] Found WiFi interface: %s (index: %d)", ifaceName, iface.Index)
-					for _, addr := range addrs {
-						log.Printf("[*]   IP: %s", addr.String())
-					}
-					break
-				}
-			}
+	// Nếu user chỉ định interface từ command line, sử dụng nó
+	if *interfaceFlag != "" {
+		iface, err = net.InterfaceByName(*interfaceFlag)
+		if err != nil {
+			log.Fatalf("[!] Failed to find interface '%s': %v\n[!] Available interfaces listed above.", *interfaceFlag, err)
 		}
-	}
+		ifaceName = *interfaceFlag
+		log.Printf("[*] Using user-specified interface: %s (index: %d)", ifaceName, iface.Index)
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			log.Printf("[*]   IP: %s", addr.String())
+		}
+	} else {
+		// Auto-detect interface (logic cũ)
+		log.Printf("[*] No interface specified, auto-detecting...")
 
-	// If WiFi not found, try exact interface names
-	if !foundExternal {
-		for _, name := range interfaceNames {
-			iface, err = net.InterfaceByName(name)
-			if err == nil {
-				// Kiểm tra xem interface có IP address không (không phải loopback)
-				addrs, _ := iface.Addrs()
+		// Try common interface names - ưu tiên external interface trước
+		// Để "The Mirage" hoạt động, cần attach vào interface nhận traffic từ bên ngoài
+		// Ưu tiên WiFi interface (wlx*), sau đó ens33 (VMware), rồi các interface khác
+		interfaceNames := []string{"wlx00127b2163a6", "wlan0", "ens33", "eth0", "enp0s3", "enp0s8", "enp0s9", "eth1"}
+		var foundExternal bool
+
+		// First, try to find WiFi interface by pattern (wlx*, wlan*, wlp*)
+		wifiInterfaces, _ := net.Interfaces()
+		for _, candidateIface := range wifiInterfaces {
+			if strings.HasPrefix(candidateIface.Name, "wlx") ||
+				strings.HasPrefix(candidateIface.Name, "wlan") ||
+				strings.HasPrefix(candidateIface.Name, "wlp") {
+				addrs, _ := candidateIface.Addrs()
 				if len(addrs) > 0 {
-					// Kiểm tra xem có phải loopback không
-					isLoopback := (iface.Flags & net.FlagLoopback) != 0
+					isLoopback := (candidateIface.Flags & net.FlagLoopback) != 0
 					if !isLoopback {
-						ifaceName = name
+						// Create a copy to avoid pointer issues
+						ifaceCopy := candidateIface
+						iface = &ifaceCopy
+						ifaceName = candidateIface.Name
 						foundExternal = true
-						log.Printf("[*] Using network interface: %s (index: %d)", ifaceName, iface.Index)
-						// Log IP addresses
+						log.Printf("[*] Found WiFi interface: %s (index: %d)", ifaceName, iface.Index)
 						for _, addr := range addrs {
 							log.Printf("[*]   IP: %s", addr.String())
 						}
 						break
-					} else {
-						log.Printf("[DEBUG] Interface %s is loopback, skipping", name)
 					}
-				} else {
-					log.Printf("[DEBUG] Interface %s has no IP addresses, skipping", name)
 				}
-			} else {
-				log.Printf("[DEBUG] Interface %s not found: %v", name, err)
 			}
 		}
-	}
 
-	// Fallback to loopback nếu không tìm thấy external interface
-	if !foundExternal {
-		iface, err = net.InterfaceByName("lo")
-		if err == nil {
-			ifaceName = "lo"
-			log.Printf("[*] Using loopback interface: %s (index: %d) - for local testing only", ifaceName, iface.Index)
-			log.Printf("[!] WARNING: For production, attach to external interface (eth0, ens33, etc.)")
-			log.Printf("[!] WARNING: Traffic from external hosts (Kali) will NOT be captured on loopback!")
+		// If WiFi not found, try exact interface names
+		if !foundExternal {
+			for _, name := range interfaceNames {
+				iface, err = net.InterfaceByName(name)
+				if err == nil {
+					// Kiểm tra xem interface có IP address không (không phải loopback)
+					addrs, _ := iface.Addrs()
+					if len(addrs) > 0 {
+						// Kiểm tra xem có phải loopback không
+						isLoopback := (iface.Flags & net.FlagLoopback) != 0
+						if !isLoopback {
+							ifaceName = name
+							foundExternal = true
+							log.Printf("[*] Using network interface: %s (index: %d)", ifaceName, iface.Index)
+							// Log IP addresses
+							for _, addr := range addrs {
+								log.Printf("[*]   IP: %s", addr.String())
+							}
+							break
+						} else {
+							log.Printf("[DEBUG] Interface %s is loopback, skipping", name)
+						}
+					} else {
+						log.Printf("[DEBUG] Interface %s has no IP addresses, skipping", name)
+					}
+				} else {
+					log.Printf("[DEBUG] Interface %s not found: %v", name, err)
+				}
+			}
 		}
-	}
 
-	if ifaceName == "" {
-		log.Fatal("[!] No suitable network interface found. Please check your network configuration.")
+		// Fallback to loopback nếu không tìm thấy external interface
+		if !foundExternal {
+			iface, err = net.InterfaceByName("lo")
+			if err == nil {
+				ifaceName = "lo"
+				log.Printf("[*] Using loopback interface: %s (index: %d) - for local testing only", ifaceName, iface.Index)
+				log.Printf("[!] WARNING: For production, attach to external interface (eth0, ens33, etc.)")
+				log.Printf("[!] WARNING: Traffic from external hosts (Kali) will NOT be captured on loopback!")
+			}
+		}
+
+		if ifaceName == "" {
+			log.Fatal("[!] No suitable network interface found. Please check your network configuration.")
+		}
 	}
 
 	// Attach XDP to detected interface
+	// CHỈ attach vào interface chính để tránh conflict và treo máy
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.PhantomProg,
 		Interface: iface.Index,
@@ -206,45 +227,23 @@ func main() {
 	}
 	defer l.Close()
 
-	// For VMware NAT: Also try to attach to all non-loopback interfaces
-	// This ensures traffic from Kali is captured regardless of routing
-	if foundExternal {
-		log.Printf("[DEBUG] Attempting to attach XDP to all non-loopback interfaces for VMware NAT compatibility...")
-		allInterfaces, _ := net.Interfaces()
-		for _, otherIface := range allInterfaces {
-			if otherIface.Index == iface.Index {
-				continue // Skip already attached interface
-			}
-			isLoopback := (otherIface.Flags & net.FlagLoopback) != 0
-			if !isLoopback {
-				addrs, _ := otherIface.Addrs()
-				if len(addrs) > 0 {
-					// Try to attach to this interface as well
-					otherLink, err := link.AttachXDP(link.XDPOptions{
-						Program:   objs.PhantomProg,
-						Interface: otherIface.Index,
-					})
-					if err == nil {
-						log.Printf("[*] Also attached XDP to interface: %s (index: %d)", otherIface.Name, otherIface.Index)
-						defer otherLink.Close()
-					} else {
-						log.Printf("[DEBUG] Failed to attach XDP to %s: %v (this is OK)", otherIface.Name, err)
-					}
-				}
-			}
-		}
-	}
+	log.Printf("[*] XDP attached to interface: %s (index: %d)", ifaceName, iface.Index)
 
 	// 3.1 Load and attach TC Egress Program (DLP) using netlink
+	// Note: TC Egress requires specific netlink APIs that may not be available on all systems
+	// If compilation fails with netlink.QdiscAdd/FilterAdd errors, TC Egress DLP will be disabled
+	// The main XDP-based protection (Phantom Protocol, The Mirage, The Portal) will still work
 	var egressObjs EgressObjects
 	var egressObjsPtr *EgressObjects
 
 	if err := LoadEgressObjects(&egressObjs, nil); err != nil {
 		log.Printf("[!] Warning: Failed to load TC egress objects: %v", err)
+		log.Printf("[!] TC Egress DLP will be disabled. Main XDP protection still active.")
 	} else {
 		// Setup TC Egress using netlink
 		if err := attachTCEgress(iface, &egressObjs); err != nil {
 			log.Printf("[!] Warning: Failed to attach TC egress: %v", err)
+			log.Printf("[!] TC Egress DLP will be disabled. Main XDP protection still active.")
 			egressObjs.Close()
 			egressObjsPtr = nil
 		} else {
@@ -305,8 +304,11 @@ func attachTCEgress(iface *net.Interface, objs *EgressObjects) error {
 		QdiscType: "clsact",
 	}
 
+	// Try to add qdisc, ignore if already exists
 	if err := netlink.QdiscAdd(qdisc); err != nil && !os.IsExist(err) {
 		// Just log, might fail if already exists which is fine
+		// Return error only if it's a real error (not "already exists")
+		return fmt.Errorf("failed to add qdisc: %v", err)
 	}
 
 	// 2. Add BPF Filter to Egress
@@ -331,6 +333,8 @@ func attachTCEgress(iface *net.Interface, objs *EgressObjects) error {
 }
 
 // manageSPAWhitelist periodically checks SPA statistics and logs changes
+// Note: SPA whitelist expiry (30 seconds) is handled by eBPF LRU map auto-eviction
+// The eBPF program uses LRU hash map which will automatically evict old entries
 func manageSPAWhitelist(objs *PhantomObjects) {
 	ticker := time.NewTicker(2 * time.Second)
 	var lastSuccessCount uint64 = 0
@@ -343,6 +347,7 @@ func manageSPAWhitelist(objs *PhantomObjects) {
 		if err := objs.SpaAuthSuccess.Lookup(key, &successVal); err == nil {
 			if successVal > lastSuccessCount {
 				logChan <- fmt.Sprintf("[SPA] ✅ Successful authentication! (Total: %d)", successVal)
+				logChan <- fmt.Sprintf("[SPA] ⏱️  IP whitelisted for 30 seconds (LRU map auto-expiry)")
 				lastSuccessCount = successVal
 			}
 		}
@@ -711,32 +716,35 @@ func startDashboard(iface string, objs *PhantomObjects, egressObjs *EgressObject
 
 // Fake Ports - "The Mirage": Các port giả mà honeypot sẽ bind
 // Khi quét từ bên ngoài, nmap sẽ thấy các port này "mở"
+// Fake Ports - The Mirage: Danh sách các port giả để honeypot bind
+// LƯU Ý: 9999 là HONEYPOT_PORT (fallback), KHÔNG phải fake port
+// Danh sách này phải khớp với is_fake_port() trong bpf/phantom.c
 var fakePorts = []int{
 	80,    // HTTP
 	443,   // HTTPS
-	3306,  // MySQL
-	5432,  // PostgreSQL
-	6379,  // Redis
-	27017, // MongoDB
-	8080,  // Admin Panel
-	8443,  // HTTPS Alt
-	9000,  // Admin Panel
-	21,    // FTP
-	23,    // Telnet
-	3389,  // RDP
-	5900,  // VNC
-	1433,  // MSSQL
-	1521,  // Oracle
-	5433,  // PostgreSQL Alt
-	11211, // Memcached
-	27018, // MongoDB Shard
-	9200,  // Elasticsearch
-	5601,  // Kibana
-	3000,  // Node.js
-	5000,  // Flask
-	8000,  // Django
-	8888,  // Jupyter
-	9999,  // Honeypot (fallback)
+	3306,  // MySQL (fake)
+	5432,  // PostgreSQL (fake)
+	6379,  // Redis (fake)
+	27017, // MongoDB (fake)
+	8080,  // Admin Panel (fake)
+	8443,  // HTTPS Alt (fake)
+	9000,  // Admin Panel (fake)
+	21,    // FTP (fake)
+	23,    // Telnet (fake)
+	3389,  // RDP (fake)
+	5900,  // VNC (fake)
+	1433,  // MSSQL (fake)
+	1521,  // Oracle (fake)
+	5433,  // PostgreSQL Alt (fake)
+	11211, // Memcached (fake)
+	27018, // MongoDB Shard (fake)
+	9200,  // Elasticsearch (fake)
+	5601,  // Kibana (fake)
+	3000,  // Node.js (fake)
+	5000,  // Flask (fake)
+	8000,  // Django (fake)
+	8888,  // Jupyter (fake)
+	// 9999 is HONEYPOT_PORT (fallback), not a fake port
 }
 
 // --- HONEYPOT LOGIC ---

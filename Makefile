@@ -16,6 +16,11 @@ build: generate
 run: build
 	sudo ./phantom-grid
 
+# Run with specific interface
+# Usage: make run-interface INTERFACE=ens33
+run-interface: build
+	sudo ./phantom-grid -interface $(INTERFACE)
+
 clean:
 	rm -f phantom-grid spa-client
 	rm -f cmd/agent/phantom_bpf*
