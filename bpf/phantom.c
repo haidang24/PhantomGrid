@@ -35,6 +35,9 @@
 #ifndef IPPROTO_UDP
 #define IPPROTO_UDP 17
 #endif
+#ifndef IPPROTO_ICMP
+#define IPPROTO_ICMP 1
+#endif
 
 // OS Fingerprint Values
 #define TTL_WINDOWS 128
@@ -264,6 +267,12 @@ int phantom_prog(struct xdp_md *ctx) {
     if ((void *)(ip + 1) > data_end) return XDP_PASS;
 
     __be32 src_ip = ip->saddr;
+
+    // --- ICMP Logic: Cho phép tất cả ICMP traffic (ping, etc.) ---
+    // ICMP cần được PASS để đảm bảo network connectivity và troubleshooting
+    if (ip->protocol == IPPROTO_ICMP) {
+        return XDP_PASS;
+    }
 
     // --- SPA Logic (UDP) ---
     if (ip->protocol == IPPROTO_UDP) {
