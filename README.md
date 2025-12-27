@@ -4,6 +4,10 @@
 
 **Phantom Grid** is a kernel-level active defense system built on **eBPF (Extended Berkeley Packet Filter)** that transforms a standard Linux server into a controlled, deceptive attack surface. It provides enterprise-grade security through deception, zero-trust access control, and real-time threat intelligence.
 
+![Phantom Grid Dashboard](assets/dashboard.png)
+
+_Real-time forensics dashboard showing live attack detection, connection statistics, and system metrics_
+
 ---
 
 ## Table of Contents
