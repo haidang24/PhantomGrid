@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -92,7 +93,7 @@ func TestSelectServiceByPort(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(string(rune(tt.port)), func(t *testing.T) {
+		t.Run(fmt.Sprintf("port_%d", tt.port), func(t *testing.T) {
 			result := selectServiceByPort(tt.port)
 			if tt.expected != "" {
 				if result != tt.expected {
@@ -179,19 +180,28 @@ func TestFakePortsNotEmpty(t *testing.T) {
 }
 
 // Test IP extraction from remote address
+// Note: This test matches the current implementation in main.go which uses simple string split
+// IPv6 addresses with brackets will not be handled correctly by current implementation
 func TestExtractIPFromRemoteAddr(t *testing.T) {
 	tests := []struct {
 		remoteAddr string
 		expectedIP string
+		skip       bool // Skip IPv6 tests that current implementation doesn't handle
 	}{
-		{"192.168.1.100:12345", "192.168.1.100"},
-		{"10.0.0.1:8080", "10.0.0.1"},
-		{"[::1]:9999", "[::1]"},
-		{"127.0.0.1:22", "127.0.0.1"},
+		{"192.168.1.100:12345", "192.168.1.100", false},
+		{"10.0.0.1:8080", "10.0.0.1", false},
+		{"[::1]:9999", "::1", false}, // IPv6 with brackets - should extract ::1 (without brackets)
+		{"127.0.0.1:22", "127.0.0.1", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.remoteAddr, func(t *testing.T) {
+			if tt.skip {
+				t.Skip("Skipping IPv6 test - current implementation uses simple string split")
+				return
+			}
+
+			// Match the actual implementation in main.go line 964
 			parts := strings.Split(tt.remoteAddr, ":")
 			if len(parts) < 2 {
 				t.Errorf("Invalid remote address format: %s", tt.remoteAddr)

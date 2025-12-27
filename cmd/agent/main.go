@@ -961,7 +961,22 @@ func handleConnection(conn net.Conn, originalPort int) {
 	}
 	remote := remoteAddr.String()
 	// Extract IP address only (remove port)
-	ip := strings.Split(remote, ":")[0]
+	// Handle IPv6 addresses with brackets: [::1]:9999 -> [::1]
+	// Handle IPv4 addresses: 192.168.1.100:12345 -> 192.168.1.100
+	var ip string
+	if strings.HasPrefix(remote, "[") {
+		// IPv6 with brackets: [::1]:9999
+		endBracket := strings.Index(remote, "]")
+		if endBracket > 0 {
+			ip = remote[1:endBracket] // Remove brackets
+		} else {
+			// Fallback to simple split if bracket format is wrong
+			ip = strings.Split(remote, ":")[0]
+		}
+	} else {
+		// IPv4: 192.168.1.100:12345
+		ip = strings.Split(remote, ":")[0]
+	}
 	t := time.Now().Format("15:04:05")
 
 	// Chọn service type dựa trên port (để tạo ảo giác thực tế hơn)
