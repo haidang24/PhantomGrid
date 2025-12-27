@@ -10,8 +10,8 @@ generate:
 	go generate ./...
 
 build: generate
-	go build -o phantom-grid cmd/agent/main.go
-	go build -o spa-client cmd/spa-client/main.go
+	cd cmd/agent && go build -o ../../phantom-grid .
+	cd cmd/spa-client && go build -o ../../spa-client .
 
 run: build
 	sudo ./phantom-grid
