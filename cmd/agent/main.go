@@ -106,7 +106,19 @@ func main() {
 	ifaceName := ""
 	var iface *net.Interface
 	var err error
-	
+
+	// List tất cả interfaces để debug
+	allInterfaces, _ := net.Interfaces()
+	log.Printf("[DEBUG] Available interfaces:")
+	for _, iface := range allInterfaces {
+		addrs, _ := iface.Addrs()
+		isLoopback := (iface.Flags & net.FlagLoopback) != 0
+		log.Printf("[DEBUG]   - %s (index: %d, loopback: %v, addrs: %d)", iface.Name, iface.Index, isLoopback, len(addrs))
+		for _, addr := range addrs {
+			log.Printf("[DEBUG]     IP: %s", addr.String())
+		}
+	}
+
 	// Try common interface names - ưu tiên external interface trước
 	// Để "The Mirage" hoạt động, cần attach vào interface nhận traffic từ bên ngoài
 	// Ưu tiên ens33 (VMware thường dùng interface này)
@@ -139,7 +151,7 @@ func main() {
 			log.Printf("[DEBUG] Interface %s not found: %v", name, err)
 		}
 	}
-	
+
 	// Fallback to loopback nếu không tìm thấy external interface
 	if !foundExternal {
 		iface, err = net.InterfaceByName("lo")
@@ -150,11 +162,12 @@ func main() {
 			log.Printf("[!] WARNING: Traffic from external hosts (Kali) will NOT be captured on loopback!")
 		}
 	}
-	
+
 	if ifaceName == "" {
 		log.Fatal("[!] No suitable network interface found. Please check your network configuration.")
 	}
 
+	// Attach XDP to detected interface
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.PhantomProg,
 		Interface: iface.Index,
@@ -163,6 +176,35 @@ func main() {
 		log.Fatal("[!] Failed to attach XDP:", err)
 	}
 	defer l.Close()
+
+	// For VMware NAT: Also try to attach to all non-loopback interfaces
+	// This ensures traffic from Kali is captured regardless of routing
+	if foundExternal {
+		log.Printf("[DEBUG] Attempting to attach XDP to all non-loopback interfaces for VMware NAT compatibility...")
+		allInterfaces, _ := net.Interfaces()
+		for _, otherIface := range allInterfaces {
+			if otherIface.Index == iface.Index {
+				continue // Skip already attached interface
+			}
+			isLoopback := (otherIface.Flags & net.FlagLoopback) != 0
+			if !isLoopback {
+				addrs, _ := otherIface.Addrs()
+				if len(addrs) > 0 {
+					// Try to attach to this interface as well
+					otherLink, err := link.AttachXDP(link.XDPOptions{
+						Program:   objs.PhantomProg,
+						Interface: otherIface.Index,
+					})
+					if err == nil {
+						log.Printf("[*] Also attached XDP to interface: %s (index: %d)", otherIface.Name, otherIface.Index)
+						defer otherLink.Close()
+					} else {
+						log.Printf("[DEBUG] Failed to attach XDP to %s: %v (this is OK)", otherIface.Name, err)
+					}
+				}
+			}
+		}
+	}
 
 	// 3.1 Load and attach TC Egress Program (DLP) using netlink
 	var egressObjs EgressObjects
@@ -189,16 +231,24 @@ func main() {
 
 	// 3.2 Start SPA Whitelist Manager
 	go manageSPAWhitelist(&objs)
-	
+
 	// Log interface info for debugging
 	logChan <- fmt.Sprintf("[SYSTEM] XDP attached to interface: %s (index: %d)", ifaceName, iface.Index)
 	logChan <- fmt.Sprintf("[SYSTEM] SPA Magic Packet port: 1337")
 	logChan <- fmt.Sprintf("[SYSTEM] SSH port 22 protected - requires SPA whitelist")
-	
+
 	// Debug: Log interface IP addresses
 	addrs, _ := iface.Addrs()
 	for _, addr := range addrs {
 		logChan <- fmt.Sprintf("[DEBUG] Interface %s has IP: %s", ifaceName, addr.String())
+	}
+
+	// Warning nếu attach vào loopback
+	if ifaceName == "lo" {
+		logChan <- "[!] WARNING: XDP attached to LOOPBACK interface!"
+		logChan <- "[!] WARNING: Traffic from external hosts (Kali) will NOT be captured!"
+		logChan <- "[!] WARNING: For VMware NAT, ensure XDP attaches to external interface (ens33, eth0, etc.)"
+		logChan <- "[!] WARNING: Check if interface detection is working correctly"
 	}
 
 	// 4. Start Internal Honeypot
@@ -256,7 +306,7 @@ func manageSPAWhitelist(objs *PhantomObjects) {
 	ticker := time.NewTicker(2 * time.Second)
 	var lastSuccessCount uint64 = 0
 	var lastFailedCount uint64 = 0
-	
+
 	for range ticker.C {
 		// Check SPA auth success counter
 		var key uint32 = 0
@@ -267,7 +317,7 @@ func manageSPAWhitelist(objs *PhantomObjects) {
 				lastSuccessCount = successVal
 			}
 		}
-		
+
 		// Check SPA auth failed counter
 		var failedVal uint64
 		if err := objs.SpaAuthFailed.Lookup(key, &failedVal); err == nil {
@@ -335,13 +385,14 @@ func startDashboard(iface string, objs *PhantomObjects, egressObjs *EgressObject
 
 	// Real-time forensics log (left side, larger)
 	logList := widgets.NewList()
-	logList.Title = " ═══ REAL-TIME FORENSICS & EVENT LOG ═══ "
+	logList.Title = " ═══ REAL-TIME FORENSICS & EVENT LOG (j/k: scroll, a: auto-scroll, G: bottom) ═══ "
 	logList.Rows = []string{
 		"[SYSTEM] Phantom Grid initialized...",
 		"[SYSTEM] eBPF XDP Hook attached...",
 		"[SYSTEM] TC Egress Hook attached (DLP Active)...",
 		"[SYSTEM] Honeypot service listening on port 9999...",
 		"[SYSTEM] Dashboard ready. Monitoring traffic...",
+		"[HELP] Use 'j'/'k' to scroll, 'G' to go to bottom, 'a' to toggle auto-scroll",
 	}
 	logList.SetRect(0, 3, termWidth/2+10, termHeight-8)
 	logList.TextStyle.Fg = ui.ColorGreen
@@ -530,29 +581,67 @@ func startDashboard(iface string, objs *PhantomObjects, egressObjs *EgressObject
 		}
 	}()
 
+	// Auto-scroll state
+	autoScroll := true
+
 	for {
 		select {
 		case e := <-uiEvents:
 			if e.Type == ui.KeyboardEvent {
-				if e.ID == "q" || e.ID == "<C-c>" {
+				switch e.ID {
+				case "q", "<C-c>":
 					return
-				}
-				if e.ID == " " {
+				case " ":
 					paused = !paused
 					if paused {
 						logChan <- "[SYSTEM] Log scrolling paused"
 					} else {
 						logChan <- "[SYSTEM] Log scrolling resumed"
 					}
+				case "j", "<Down>":
+					// Scroll down
+					logList.ScrollDown()
+					autoScroll = false
+					ui.Render(logList, connStatsBox)
+				case "k", "<Up>":
+					// Scroll up
+					logList.ScrollUp()
+					autoScroll = false
+					ui.Render(logList, connStatsBox)
+				case "g", "<Home>":
+					// Scroll to top
+					logList.ScrollTop()
+					autoScroll = false
+					ui.Render(logList, connStatsBox)
+				case "G", "<End>":
+					// Scroll to bottom (enable auto-scroll)
+					logList.ScrollBottom()
+					autoScroll = true
+					ui.Render(logList, connStatsBox)
+				case "a":
+					// Toggle auto-scroll
+					autoScroll = !autoScroll
+					if autoScroll {
+						logList.ScrollBottom()
+						logChan <- "[SYSTEM] Auto-scroll enabled (press 'a' to disable)"
+					} else {
+						logChan <- "[SYSTEM] Auto-scroll disabled (press 'a' to enable, 'G' to go to bottom)"
+					}
+					ui.Render(logList, connStatsBox)
 				}
 			}
 		case msg := <-logChan:
 			if !paused {
 				logList.Rows = append(logList.Rows, msg)
-				if len(logList.Rows) > termHeight-15 {
-					logList.Rows = logList.Rows[1:]
+				// Keep more logs in memory (allow scrolling through history)
+				maxLogs := (termHeight - 8) * 5 // Keep 5x visible area
+				if len(logList.Rows) > maxLogs {
+					logList.Rows = logList.Rows[len(logList.Rows)-maxLogs:]
 				}
-				logList.ScrollBottom()
+				// Only auto-scroll if enabled
+				if autoScroll {
+					logList.ScrollBottom()
+				}
 			}
 
 			// Track statistics from log messages (thread-safe write)
@@ -654,7 +743,7 @@ func startHoneypot() {
 	} else {
 		listeners = append(listeners, ln9999)
 		logChan <- "[SYSTEM] Honeypot listening on port 9999 (fallback for redirected ports)"
-		
+
 		wg.Add(1)
 		go func(l net.Listener) {
 			defer wg.Done()
@@ -676,7 +765,7 @@ func startHoneypot() {
 	}
 
 	logChan <- fmt.Sprintf("[SYSTEM] Honeypot bound to %d ports (%d direct, 1 fallback) - The Mirage active", len(listeners), len(boundPorts))
-	
+
 	// Cleanup on exit
 	defer func() {
 		for _, ln := range listeners {
@@ -793,43 +882,43 @@ func handleConnection(conn net.Conn, originalPort int) {
 func handleSSHInteraction(conn net.Conn, remote, t string) {
 	// Simulate SSH handshake delay
 	time.Sleep(100 * time.Millisecond)
-	
+
 	// Send SSH prompt
 	prompt := "root@server:~# "
 	conn.Write([]byte(prompt))
-	
+
 	ip := strings.Split(remote, ":")[0]
 	currentDir := "/root"
 	commandHistory := []string{}
-	
+
 	buf := make([]byte, 1024)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil || n == 0 {
 			return
 		}
-		
+
 		input := strings.TrimSpace(string(buf[:n]))
 		if len(input) == 0 {
 			conn.Write([]byte(prompt))
 			continue
 		}
-		
+
 		// Log command
 		logChan <- fmt.Sprintf("[%s] SSH COMMAND: %s", t, input)
 		logAttack(ip, fmt.Sprintf("SSH: %s", input))
 		commandHistory = append(commandHistory, input)
-		
+
 		// Parse command
 		parts := strings.Fields(input)
 		if len(parts) == 0 {
 			conn.Write([]byte(prompt))
 			continue
 		}
-		
+
 		cmd := parts[0]
 		args := parts[1:]
-		
+
 		// Handle commands
 		switch cmd {
 		case "exit", "logout":
@@ -928,32 +1017,32 @@ func handleHTTPInteraction(conn net.Conn, remote, t string) {
 	if err != nil {
 		return
 	}
-	
+
 	request := string(buf[:n])
 	ip := strings.Split(remote, ":")[0]
-	
+
 	// Parse HTTP request
 	lines := strings.Split(request, "\r\n")
 	if len(lines) == 0 {
 		return
 	}
-	
+
 	requestLine := lines[0]
 	logChan <- fmt.Sprintf("[%s] HTTP REQUEST: %s", t, requestLine)
 	logAttack(ip, fmt.Sprintf("HTTP: %s", requestLine))
-	
+
 	// Extract method and path
 	parts := strings.Fields(requestLine)
 	if len(parts) < 2 {
 		return
 	}
-	
+
 	method := parts[0]
 	path := parts[1]
-	
+
 	// Generate response based on path
 	var response string
-	
+
 	switch path {
 	case "/", "/index.html", "/index.php":
 		response = "HTTP/1.1 200 OK\r\n"
@@ -1017,9 +1106,9 @@ func handleHTTPInteraction(conn net.Conn, remote, t string) {
 			response += "<h1>404 Not Found</h1><p>The requested URL was not found on this server.</p>"
 		}
 	}
-	
+
 	conn.Write([]byte(response))
-	
+
 	// Keep connection alive for a short time to allow multiple requests
 	time.Sleep(100 * time.Millisecond)
 }
@@ -1029,10 +1118,10 @@ func handleTelnetInteraction(conn net.Conn, remote, t string) {
 	conn.Write([]byte("\r\nUbuntu 20.04.3 LTS\r\n\r\n"))
 	time.Sleep(200 * time.Millisecond)
 	conn.Write([]byte("server login: "))
-	
+
 	buf := make([]byte, 1024)
 	loginAttempts := 0
-	
+
 	// Wait for username
 	n, err := conn.Read(buf)
 	if err != nil || n == 0 {
@@ -1040,9 +1129,9 @@ func handleTelnetInteraction(conn net.Conn, remote, t string) {
 	}
 	username := strings.TrimSpace(string(buf[:n]))
 	logChan <- fmt.Sprintf("[%s] TELNET LOGIN ATTEMPT: username='%s'", t, username)
-	
+
 	conn.Write([]byte("\r\nPassword: "))
-	
+
 	// Wait for password (don't echo)
 	n, err = conn.Read(buf)
 	if err != nil || n == 0 {
@@ -1050,14 +1139,14 @@ func handleTelnetInteraction(conn net.Conn, remote, t string) {
 	}
 	password := strings.TrimSpace(string(buf[:n]))
 	loginAttempts++
-	
+
 	ip := strings.Split(remote, ":")[0]
 	logChan <- fmt.Sprintf("[%s] TELNET PASSWORD ATTEMPT #%d from %s (password length: %d)", t, loginAttempts, ip, len(password))
 	logAttack(ip, fmt.Sprintf("TELNET_LOGIN: user=%s, pass=***", username))
-	
+
 	// Simulate login delay
 	time.Sleep(500 * time.Millisecond)
-	
+
 	// Always fail login but show different messages
 	if loginAttempts < 3 {
 		conn.Write([]byte("\r\nLogin incorrect\r\n\r\n"))
@@ -1076,7 +1165,7 @@ func handleTelnetInteraction(conn net.Conn, remote, t string) {
 		loginAttempts++
 		logChan <- fmt.Sprintf("[%s] TELNET PASSWORD ATTEMPT #%d from %s", t, loginAttempts, ip)
 	}
-	
+
 	// After 3 attempts, show "connection closed"
 	conn.Write([]byte("\r\nToo many login attempts. Connection closed.\r\n"))
 }
@@ -1085,7 +1174,7 @@ func handleMySQLInteraction(conn net.Conn, remote, t string) {
 	ip := strings.Split(remote, ":")[0]
 	logChan <- fmt.Sprintf("[%s] MySQL connection attempt from %s", t, ip)
 	logAttack(ip, "MySQL_CONNECTION")
-	
+
 	// MySQL handshake has already been sent in banner
 	// Wait for authentication packet
 	buf := make([]byte, 1024)
@@ -1093,7 +1182,7 @@ func handleMySQLInteraction(conn net.Conn, remote, t string) {
 	if err != nil || n == 0 {
 		return
 	}
-	
+
 	// Parse authentication attempt
 	// MySQL auth packet structure is complex, but we can detect username
 	if n > 4 {
@@ -1104,12 +1193,12 @@ func handleMySQLInteraction(conn net.Conn, remote, t string) {
 			logAttack(ip, fmt.Sprintf("MySQL_LOGIN: user=%s", username))
 		}
 	}
-	
+
 	// Send error response (authentication failed)
 	errorPacket := []byte{0xff, 0x15, 0x04, 0x23, 0x28, 0x30, 0x30, 0x30, 0x30, 0x34}
 	errorPacket = append(errorPacket, []byte("Access denied for user")...)
 	conn.Write(errorPacket)
-	
+
 	time.Sleep(100 * time.Millisecond)
 }
 
@@ -1117,28 +1206,28 @@ func handleRedisInteraction(conn net.Conn, remote, t string) {
 	ip := strings.Split(remote, ":")[0]
 	logChan <- fmt.Sprintf("[%s] Redis connection from %s", t, ip)
 	logAttack(ip, "REDIS_CONNECTION")
-	
+
 	buf := make([]byte, 1024)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil || n == 0 {
 			return
 		}
-		
+
 		command := strings.TrimSpace(string(buf[:n]))
 		logChan <- fmt.Sprintf("[%s] REDIS COMMAND: %s", t, command)
 		logAttack(ip, fmt.Sprintf("REDIS: %s", command))
-		
+
 		// Parse Redis protocol (simplified)
 		parts := strings.Fields(command)
 		if len(parts) == 0 {
 			conn.Write([]byte("-ERR unknown command\r\n"))
 			continue
 		}
-		
+
 		cmd := strings.ToUpper(parts[0])
 		args := parts[1:]
-		
+
 		switch cmd {
 		case "PING":
 			conn.Write([]byte("+PONG\r\n"))
@@ -1178,32 +1267,32 @@ func handleFTPInteraction(conn net.Conn, remote, t string) {
 	ip := strings.Split(remote, ":")[0]
 	logChan <- fmt.Sprintf("[%s] FTP connection from %s", t, ip)
 	logAttack(ip, "FTP_CONNECTION")
-	
+
 	// FTP banner already sent
 	conn.Write([]byte("220 Welcome to FTP Server\r\n"))
-	
+
 	buf := make([]byte, 1024)
 	authenticated := false
-	
+
 	for {
 		n, err := conn.Read(buf)
 		if err != nil || n == 0 {
 			return
 		}
-		
+
 		command := strings.TrimSpace(string(buf[:n]))
 		logChan <- fmt.Sprintf("[%s] FTP COMMAND: %s", t, command)
 		logAttack(ip, fmt.Sprintf("FTP: %s", command))
-		
+
 		parts := strings.Fields(command)
 		if len(parts) == 0 {
 			conn.Write([]byte("500 Syntax error\r\n"))
 			continue
 		}
-		
+
 		cmd := strings.ToUpper(parts[0])
 		args := parts[1:]
-		
+
 		switch cmd {
 		case "USER":
 			if len(args) > 0 {
