@@ -323,16 +323,32 @@ int phantom_prog(struct xdp_md *ctx) {
         // - Outbound connections (SYN từ server) hoạt động bình thường
         // - Established connections (ACK, data packets) hoạt động bình thường
         if (syn && !ack && !is_critical_asset_port(tcp->dest)) {
-            // Nếu là fake port → PASS (honeypot đã bind, sẽ phản hồi SYN-ACK)
-            // Nếu honeypot không bind được port gốc, kernel sẽ gửi RST → nmap thấy "closed"
-            // Nhưng nếu bind được, honeypot sẽ phản hồi SYN-ACK → nmap thấy "open"
-            if (is_fake_port(tcp->dest)) {
+            // Nếu là fake port → REDIRECT đến port 9999 (honeypot fallback)
+            // Điều này đảm bảo dù honeypot không bind được port gốc, vẫn có service listen trên 9999
+            // Redirect đảm bảo packets được forward đến honeypot một cách chắc chắn
+            if (is_fake_port(tcp->dest) && tcp->dest != bpf_htons(HONEYPOT_PORT)) {
+                __u32 key = 0;
+                __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
+                if (val) __sync_fetch_and_add(val, 1);
+
+                __be16 old_port = tcp->dest;
+                __be16 new_port = bpf_htons(HONEYPOT_PORT);
+                
+                update_csum16(&tcp->check, old_port, new_port);
+                tcp->dest = new_port;
+                
+                mutate_os_personality(ip, tcp);
+                return XDP_PASS; // Redirect đến honeypot port 9999
+            }
+            
+            // Nếu là honeypot port (9999) → PASS (honeypot sẽ phản hồi SYN-ACK)
+            if (tcp->dest == bpf_htons(HONEYPOT_PORT)) {
                 __u32 key = 0;
                 __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
                 if (val) __sync_fetch_and_add(val, 1);
                 
                 mutate_os_personality(ip, tcp);
-                return XDP_PASS; // Honeypot sẽ phản hồi SYN-ACK nếu bind được port
+                return XDP_PASS;
             }
             
             // Nếu không phải fake port và không phải critical asset → DROP (ẩn port)

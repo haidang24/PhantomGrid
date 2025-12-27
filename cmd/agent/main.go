@@ -783,9 +783,44 @@ func startHoneypot() {
 	}
 
 	// Fallback: Bind port 9999 cho các port không bind được
+	// QUAN TRỌNG: Port 9999 phải available để XDP redirect hoạt động
 	ln9999, err := net.Listen("tcp", ":9999")
 	if err != nil {
-		logChan <- fmt.Sprintf("[WARN] Cannot bind port 9999: %v", err)
+		logChan <- fmt.Sprintf("[ERROR] Cannot bind port 9999: %v", err)
+		logChan <- "[ERROR] Port 9999 is required for XDP redirect fallback!"
+		logChan <- "[ERROR] To free port 9999, run: sudo lsof -i :9999 && sudo kill -9 <PID>"
+		logChan <- "[ERROR] Or change HONEYPOT_PORT in bpf/phantom.c and rebuild"
+		// Try alternative ports
+		fallbackPorts := []int{9998, 9997, 9996, 8888, 7777}
+		var fallbackListener net.Listener
+		for _, altPort := range fallbackPorts {
+			fallbackListener, err = net.Listen("tcp", fmt.Sprintf(":%d", altPort))
+			if err == nil {
+				logChan <- fmt.Sprintf("[WARN] Using alternative fallback port %d instead of 9999", altPort)
+				logChan <- fmt.Sprintf("[WARN] NOTE: XDP is still redirecting to port 9999 - connections may fail!")
+				listeners = append(listeners, fallbackListener)
+				wg.Add(1)
+				go func(l net.Listener, p int) {
+					defer wg.Done()
+					for {
+						conn, err := l.Accept()
+						if err != nil {
+							logChan <- fmt.Sprintf("[ERROR] Honeypot accept error on port %d: %v", p, err)
+							continue
+						}
+						remoteAddr := conn.RemoteAddr()
+						if remoteAddr != nil {
+							logChan <- fmt.Sprintf("[DEBUG] Honeypot accepted connection on port %d (alternative fallback) from %s", p, remoteAddr.String())
+						}
+						go handleConnection(conn, p)
+					}
+				}(fallbackListener, altPort)
+				break
+			}
+		}
+		if fallbackListener == nil {
+			logChan <- "[ERROR] Failed to bind any fallback port!"
+		}
 	} else {
 		listeners = append(listeners, ln9999)
 		logChan <- "[SYSTEM] Honeypot listening on port 9999 (fallback for redirected ports)"
@@ -812,7 +847,36 @@ func startHoneypot() {
 
 	if len(listeners) == 0 {
 		logChan <- "[ERROR] Failed to bind any ports"
+		logChan <- "[ERROR] Please check if ports are available or run with sudo for ports < 1024"
 		return
+	}
+
+	// Check if port 9999 is bound (critical for XDP redirect)
+	port9999Bound := false
+	for _, port := range boundPorts {
+		if port == 9999 {
+			port9999Bound = true
+			break
+		}
+	}
+	if !port9999Bound {
+		// Check if port 9999 is in listeners (fallback)
+		for _, ln := range listeners {
+			addr := ln.Addr()
+			if addr != nil {
+				addrStr := addr.String()
+				if strings.Contains(addrStr, ":9999") {
+					port9999Bound = true
+					break
+				}
+			}
+		}
+	}
+
+	if !port9999Bound {
+		logChan <- "[WARN] Port 9999 is NOT bound - XDP redirect will fail!"
+		logChan <- "[WARN] Please free port 9999: sudo lsof -i :9999 && sudo kill -9 <PID>"
+		logChan <- "[WARN] Or change HONEYPOT_PORT in bpf/phantom.c and rebuild"
 	}
 
 	logChan <- fmt.Sprintf("[SYSTEM] Honeypot bound to %d ports (%d direct, 1 fallback) - The Mirage active", len(listeners), len(boundPorts))
