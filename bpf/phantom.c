@@ -306,21 +306,15 @@ int phantom_prog(struct xdp_md *ctx) {
         // Kiểm tra header TCP (20 bytes)
         if ((void *)(tcp + 1) > data_end) return XDP_PASS;
 
-        // 1. THE PHANTOM PROTOCOL: Bảo vệ Critical Assets (SSH, Database, Admin Panel)
-        // Nguyên lý: "Không thể tấn công thứ bạn không nhìn thấy"
-        // Mặc định DROP toàn bộ traffic đến các cổng quan trọng
-        // Chỉ cho phép nếu IP đã được whitelist qua SPA
-        if (is_critical_asset_port(tcp->dest)) {
+        // 1. Bảo vệ SSH (Critical Asset) - Chỉ cho phép nếu whitelisted qua SPA
+        if (tcp->dest == bpf_htons(SSH_PORT)) {
             if (!is_spa_whitelisted(src_ip)) {
-                // Server hoàn toàn "chết" (Dead Host) dưới góc nhìn của hacker
-                // Không có phản hồi, không có RST, hoàn toàn im lặng
-                return XDP_DROP;
+                return XDP_DROP; // Server "chết" dưới góc nhìn hacker
             }
-            // IP đã được whitelist qua SPA - cho phép truy cập
-            return XDP_PASS;
+            return XDP_PASS; // IP đã whitelisted
         }
 
-        // 2. Chặn Scan
+        // 2. Chặn Stealth Scans
         if (is_stealth_scan(tcp)) {
             __u32 key = 0;
             __u64 *val = bpf_map_lookup_elem(&stealth_drops, &key);
@@ -328,120 +322,29 @@ int phantom_prog(struct xdp_md *ctx) {
             return XDP_DROP;
         }
 
-        // 3. THE PORTAL: Transparent Redirection (DNAT không trạng thái)
-        // Khi hacker tương tác sâu hơn với "Dịch vụ ma", lưu lượng mạng bị âm thầm
-        // chuyển hướng sang Container Honeypot để thu thập hành vi.
-        // Quá trình chuyển hướng trong suốt, không thay đổi địa chỉ IP đích.
-        
-        __u8 *flags_byte = ((__u8 *)tcp + 13);
-        __u8 flags = *flags_byte;
-        __u8 syn = flags & 0x02;
-        __u8 ack = flags & 0x10;
-        __u8 fin = flags & 0x01;
-        __u8 rst = flags & 0x04;
-        
-        // QUAN TRỌNG: Tất cả packets đến HONEYPOT_PORT (9999) phải được PASS NGAY LẬP TỨC
-        // Điều này đảm bảo honeypot có thể nhận và xử lý tất cả connections
-        // Bao gồm: SYN (kết nối mới), ACK (established), data, FIN, RST
-        // Đặt check này TRƯỚC tất cả logic khác để đảm bảo packets đến 9999 luôn được PASS
-        // Đây là điều kiện QUAN TRỌNG NHẤT để honeypot hoạt động
+        // 3. QUAN TRỌNG: PASS tất cả packets đến HONEYPOT_PORT (9999)
+        // Đảm bảo honeypot nhận được tất cả connections (SYN, ACK, data, FIN, RST)
         if (tcp->dest == bpf_htons(HONEYPOT_PORT)) {
-            // Update statistics cho SYN packets đến honeypot
-            if (syn && !ack) {
-                __u32 key = 0;
-                __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
-                if (val) __sync_fetch_and_add(val, 1);
-            }
-            mutate_os_personality(ip, tcp);
-            return XDP_PASS; // PASS tất cả packets đến honeypot - KHÔNG CẦN TRACK
-        }
-        
-        // Connection Tracking cho Transparent Redirection (The Portal)
-        // Logic: Sau khi redirect SYN từ fake port (80) → 9999, các packets tiếp theo
-        // (ACK, data, FIN, RST) sẽ có dest_port = 9999 và đã được PASS ở trên.
-        // Tuy nhiên, cần track để xử lý các edge cases:
-        // - Packets đến original port sau khi SYN đã redirect (shouldn't happen, but handle gracefully)
-        // - Cleanup connection tracking khi connection kết thúc
-        
-        // Tạo connection key: (src_ip << 32) | (src_port << 16)
-        // Dùng src_ip:src_port để track, không dùng dest_port vì dest_port thay đổi sau redirect
-        __u64 conn_key = ((__u64)src_ip << 32) | ((__u64)bpf_ntohs(tcp->source) << 16);
-        
-        // Kiểm tra xem connection này đã được redirect chưa
-        __be16 *original_port = bpf_map_lookup_elem(&redirect_map, &conn_key);
-        
-        // Nếu connection đã được redirect
-        if (original_port) {
-            // Edge case: Nếu dest_port vẫn là original port (shouldn't happen after SYN redirect)
-            // Redirect đến 9999 để đảm bảo consistency
-            if (tcp->dest == *original_port && tcp->dest != bpf_htons(HONEYPOT_PORT)) {
-                __be16 old_port = tcp->dest;
-                __be16 new_port = bpf_htons(HONEYPOT_PORT);
-                
-                update_csum16(&tcp->check, old_port, new_port);
-                tcp->dest = new_port;
-            }
-            // Nếu dest_port đã là 9999 (normal case) → đã được PASS ở trên
-            
-            // Cleanup map khi connection kết thúc (FIN hoặc RST từ client)
-            // Chỉ cleanup khi packet từ client (không có ACK flag hoặc có FIN/RST)
-            if ((fin || rst) && !ack) {
-                bpf_map_delete_elem(&redirect_map, &conn_key);
-            }
-            
-            // Nếu dest_port đã là 9999, đã được PASS ở trên, không cần xử lý thêm
-            // Nếu dest_port vẫn là original port (edge case), đã redirect ở trên
             mutate_os_personality(ip, tcp);
             return XDP_PASS;
         }
-        
-        // 4. THE MIRAGE: Xử lý SYN packets mới (inbound connection initiation)
-        // Bỏ qua các Critical Assets (đã được bảo vệ bởi Phantom Protocol)
-        // CHỈ xử lý SYN packets (không có ACK) - đây là inbound connection initiation
-        if (syn && !ack && !is_critical_asset_port(tcp->dest)) {
-            // Nếu là fake port → REDIRECT đến port 9999 và track connection
-            if (is_fake_port(tcp->dest) && tcp->dest != bpf_htons(HONEYPOT_PORT)) {
-                __u32 key = 0;
-                __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
-                if (val) __sync_fetch_and_add(val, 1);
 
-                // Lưu original port vào map để track connection
-                // Connection key dùng src_ip:src_port (không dùng dest_port vì sẽ thay đổi)
-                __be16 orig_port = tcp->dest;
-                bpf_map_update_elem(&redirect_map, &conn_key, &orig_port, BPF_ANY);
+        // 4. Redirect TẤT CẢ ports khác (trừ SSH và 9999) đến honeypot
+        // Logic đơn giản: Nếu không phải SSH và không phải 9999 → redirect đến 9999
+        // Điều này đảm bảo honeypot nhận được traffic từ mọi port
+        __u32 key = 0;
+        __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
+        if (val) __sync_fetch_and_add(val, 1);
 
-                // Redirect SYN packet đến honeypot port
-                __be16 old_port = tcp->dest;
-                __be16 new_port = bpf_htons(HONEYPOT_PORT);
-                
-                update_csum16(&tcp->check, old_port, new_port);
-                tcp->dest = new_port;
-                
-                mutate_os_personality(ip, tcp);
-                return XDP_PASS; // Redirect đến honeypot port 9999
-            }
-            
-            // Lưu ý: SYN packets đến honeypot port (9999) đã được xử lý ở trên
-            // Nếu đến đây, dest_port không phải 9999 và không phải fake port
-            
-            // Nếu không phải fake port và không phải critical asset → DROP (ẩn port)
-            // Điều này đảm bảo hacker chỉ thấy các port giả, không thấy các port thật
-            return XDP_DROP;
-        }
+        __be16 old_port = tcp->dest;
+        __be16 new_port = bpf_htons(HONEYPOT_PORT);
         
-        // 5. Xử lý các packets không phải SYN (ACK, data, FIN, RST)
-        // - Nếu dest_port là 9999 → đã được PASS ở trên
-        // - Nếu connection đã được track → đã được xử lý ở connection tracking
-        // - Nếu không phải SYN và không được track → có thể là outbound hoặc established connection
-        //   → Cho phép pass để đảm bảo network connectivity
-        //   (Outbound connections từ server cần hoạt động bình thường)
+        update_csum16(&tcp->check, old_port, new_port);
+        tcp->dest = new_port;
+        
+        mutate_os_personality(ip, tcp);
     }
     
-    // Default: PASS tất cả traffic không phải TCP/IP hoặc không match các điều kiện trên
-    // Điều này đảm bảo:
-    // - Non-IP traffic (ARP, etc.) được pass
-    // - IPv6 traffic được pass (chưa được xử lý)
-    // - Các protocols khác được pass
     return XDP_PASS;
 }
 
