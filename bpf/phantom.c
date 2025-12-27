@@ -329,16 +329,18 @@ int phantom_prog(struct xdp_md *ctx) {
         // Nếu honeypot bind được → port hiện "open" với port gốc (80, 443, 3306, etc.)
         // Nếu honeypot không bind được (port < 1024 cần sudo) → kernel gửi RST → port hiện "closed"
         // LƯU Ý: Để tất cả fake ports hiện "open", cần chạy với sudo để bind ports < 1024
+        // QUAN TRỌNG: Không mutate OS personality cho fake ports để tránh checksum issues
+        // Tương tự như port 9999, chỉ PASS trực tiếp
         if (is_fake_port(tcp->dest)) {
             // Update statistics
             __u32 key = 0;
             __u64 *val = bpf_map_lookup_elem(&attack_stats, &key);
             if (val) __sync_fetch_and_add(val, 1);
             
-            // PASS packet trực tiếp đến fake port (không redirect)
+            // PASS packet trực tiếp đến fake port (không redirect, không mutate)
             // Honeypot sẽ bind và respond trên port gốc
+            // Không mutate OS personality để tránh checksum issues và packets bị drop
             // Nếu honeypot không bind được, kernel sẽ gửi RST
-            mutate_os_personality(ip, tcp);
             
             // PASS - honeypot sẽ respond trên port gốc
             // Nmap sẽ thấy port gốc (80, 443, 3306, etc.) là "open"
